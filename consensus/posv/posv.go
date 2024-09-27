@@ -64,6 +64,11 @@ type Masternode struct {
 	Stake   *big.Int
 }
 
+type MasternodeGroup struct {
+	Stake       string
+	AddressList []common.Address
+}
+
 type TradingService interface {
 	GetTradingStateRoot(block *types.Block, author common.Address) (common.Hash, error)
 	GetTradingState(block *types.Block, author common.Address) (*tradingstate.TradingStateDB, error)
@@ -270,7 +275,8 @@ type Posv struct {
 	GetLendingService          func() LendingService
 	HookGetSignersFromContract func(blockHash common.Hash) ([]common.Address, error)
 
-	HookGetSignersFromContractV2 func(blockHash common.Hash) ([]common.Address, error)
+	//HookGetSignersFromContractV2           func(blockHash common.Hash) ([]common.Address, error)
+	HookGetAllSignersAndStakesFromContract func(blockHash common.Hash) (map[common.Address]*big.Int, error)
 }
 
 // New creates a PoSV proof-of-stake-voting consensus engine with the initial
@@ -446,11 +452,11 @@ func (c *Posv) verifyCascadingFields(chain consensus.ChainReader, header *types.
 		return err
 	}
 
-	signers := snap.GetSigners()
-	err = c.checkSignersOnCheckpoint(chain, header, signers)
-	if err == nil {
-		return c.verifySeal(chain, header, parents, fullVerify)
-	}
+	//signers := snap.GetSigners()
+	//err = c.checkSignersOnCheckpoint(chain, header, signers)
+	//if err == nil {
+	//	return c.verifySeal(chain, header, parents, fullVerify)
+	//}
 
 	//signers, err = c.GetSignersFromContract(chain, header)
 	//if err != nil {
@@ -462,13 +468,68 @@ func (c *Posv) verifyCascadingFields(chain consensus.ChainReader, header *types.
 	//}
 
 	// A workaround for the length of the Signers List of "TomoValidator" contract > 150
-	signers, err = c.GetSignersFromContractV2(chain, header)
-	if err != nil {
-		return err
-	}
-	err = c.checkSignersOnCheckpointV2(chain, snap, header, signers)
-	if err == nil {
-		return c.verifySeal(chain, header, parents, fullVerify)
+	//signers, err = c.GetSignersFromContractV2(chain, header)
+	//if err != nil {
+	//	return err
+	//}
+	//err = c.checkSignersOnCheckpointV2(chain, snap, header, signers)
+	//if err == nil {
+	//	return c.verifySeal(chain, header, parents, fullVerify)
+	//}
+
+	// A workaround (fix)
+	signers := snap.GetSigners()
+	if len(signers) > 150 {
+		// [A] Build: List of Signers
+		var newSigners []common.Address
+
+		extraSuffix := len(header.Extra) - extraSeal
+		masternodesFromCheckpointHeader := common.ExtractAddressFromBytes(header.Extra[extraVanity:extraSuffix])
+		newSigners = append(newSigners, masternodesFromCheckpointHeader...)
+
+		penaltiesFromCheckpointHeader := common.ExtractAddressFromBytes(header.Penalties)
+		newSigners = append(newSigners, penaltiesFromCheckpointHeader...)
+
+		var penaltiesFromOtherCheckpointHeaders []common.Address
+		for i := 1; i <= common.LimitPenaltyEpoch; i++ {
+			if number > uint64(i)*c.config.Epoch {
+				penaltiesFromBlock := GetPenaltiesFromBlock(chain, number-uint64(i)*c.config.Epoch)
+				penaltiesFromOtherCheckpointHeaders = append(penaltiesFromOtherCheckpointHeaders, penaltiesFromBlock...)
+			}
+		}
+		newSigners = append(newSigners, penaltiesFromOtherCheckpointHeaders...)
+		log.Info("[Workaround - Step A] Building a list of Signers", newSigners)
+
+		// [B] Check: Penalties - Signers - Validators
+		log.Info("[Workaround - Step B] Validating the Block", number, "with the list of Signers")
+		err = c.checkSignersOnCheckpoint(chain, header, newSigners)
+		if err == nil {
+			// [C] Check: Are the 150 largest Signers from the Smart Contract included in this list of Signers?
+			log.Info("[Workaround - Step C] Validating the list of Signers")
+			signersHeader, signersContract, err := c.buildTwoSignerLists(chain, header, newSigners)
+			if err == nil {
+				log.Info("A list of Signers from Header", signersHeader)
+				log.Info("A list of Signers from Smart Contract", signersContract)
+				err = validateTwoSignerLists(signersHeader, signersContract)
+				if err == nil {
+					// update snapshot's Signers into Cache at Checkpoint Block - 1 and not consider order of Signers based on Stake
+					newMNs := make(map[common.Address]struct{})
+					for _, signer := range newSigners {
+						newMNs[signer] = struct{}{}
+					}
+
+					snap.Signers = newMNs
+					c.recents.Add(snap.Hash, snap)
+
+					return c.verifySeal(chain, header, parents, fullVerify)
+				}
+			}
+		}
+	} else {
+		err = c.checkSignersOnCheckpoint(chain, header, signers)
+		if err == nil {
+			return c.verifySeal(chain, header, parents, fullVerify)
+		}
 	}
 
 	return err
@@ -523,82 +584,82 @@ func (c *Posv) checkSignersOnCheckpoint(chain consensus.ChainReader, header *typ
 	return nil
 }
 
-func (c *Posv) checkSignersOnCheckpointV2(chain consensus.ChainReader, snap *Snapshot, header *types.Header, signers []common.Address) error {
-	number := header.Number.Uint64()
-
-	penPenalties := []common.Address{}
-	if c.HookPenalty != nil || c.HookPenaltyTIPSigning != nil {
-		var err error
-		if chain.Config().IsTIPSigning(header.Number) {
-			penPenalties, err = c.HookPenaltyTIPSigning(chain, header, signers)
-		} else {
-			penPenalties, err = c.HookPenalty(chain, number)
-		}
-		if err != nil {
-			return err
-		}
-
-		for _, address := range penPenalties {
-			log.Debug("Penalty Info", "address", address, "number", number)
-		}
-
-		bytePenalties := common.ExtractAddressToBytes(penPenalties)
-		if !bytes.Equal(header.Penalties, bytePenalties) {
-			return errInvalidCheckpointPenalties
-		}
-	}
-
-	signers = common.RemoveItemFromArray(signers, penPenalties)
-
-	for i := 1; i <= common.LimitPenaltyEpoch; i++ {
-		if number > uint64(i)*c.config.Epoch {
-			signers = RemovePenaltiesFromBlock(chain, signers, number-uint64(i)*c.config.Epoch)
-		}
-	}
-
-	extraSuffix := len(header.Extra) - extraSeal
-	masternodesFromCheckpointHeader := common.ExtractAddressFromBytes(header.Extra[extraVanity:extraSuffix])
-
-	validSigners := compareSignersListsV2(masternodesFromCheckpointHeader, signers)
-	if !validSigners {
-		log.Error("Masternodes lists are different in checkpoint header and snapshot", "number", number,
-			"masternodes_from_checkpoint_header", masternodesFromCheckpointHeader,
-			"masternodes_in_snapshot", signers,
-			"penList", penPenalties)
-		return errInvalidCheckpointSigners
-	}
-
-	if c.HookVerifyMNs != nil {
-		err := c.HookVerifyMNs(header, masternodesFromCheckpointHeader)
-		if err != nil {
-			return err
-		}
-	}
-
-	// update snapshot's Signers into Cache at Checkpoint Block - 1 and not consider order of Signers based on Stake
-	var penaltiesList []common.Address
-	for i := 1; i <= common.LimitPenaltyEpoch; i++ {
-		if number > uint64(i)*c.config.Epoch {
-			penaltiesFromBlock := GetPenaltiesFromBlock(chain, number-uint64(i)*c.config.Epoch)
-			penaltiesList = append(penaltiesList, penaltiesFromBlock...)
-		}
-	}
-
-	var newSignersList []common.Address
-	newSignersList = append(newSignersList, masternodesFromCheckpointHeader...)
-	newSignersList = append(newSignersList, penaltiesList...)
-	newSignersList = append(newSignersList, penPenalties...)
-
-	newMNsList := make(map[common.Address]struct{})
-	for _, signer := range newSignersList {
-		newMNsList[signer] = struct{}{}
-	}
-
-	snap.Signers = newMNsList
-	c.recents.Add(snap.Hash, snap)
-
-	return nil
-}
+//func (c *Posv) checkSignersOnCheckpointV2(chain consensus.ChainReader, snap *Snapshot, header *types.Header, signers []common.Address) error {
+//	number := header.Number.Uint64()
+//
+//	penPenalties := []common.Address{}
+//	if c.HookPenalty != nil || c.HookPenaltyTIPSigning != nil {
+//		var err error
+//		if chain.Config().IsTIPSigning(header.Number) {
+//			penPenalties, err = c.HookPenaltyTIPSigning(chain, header, signers)
+//		} else {
+//			penPenalties, err = c.HookPenalty(chain, number)
+//		}
+//		if err != nil {
+//			return err
+//		}
+//
+//		for _, address := range penPenalties {
+//			log.Debug("Penalty Info", "address", address, "number", number)
+//		}
+//
+//		bytePenalties := common.ExtractAddressToBytes(penPenalties)
+//		if !bytes.Equal(header.Penalties, bytePenalties) {
+//			return errInvalidCheckpointPenalties
+//		}
+//	}
+//
+//	signers = common.RemoveItemFromArray(signers, penPenalties)
+//
+//	for i := 1; i <= common.LimitPenaltyEpoch; i++ {
+//		if number > uint64(i)*c.config.Epoch {
+//			signers = RemovePenaltiesFromBlock(chain, signers, number-uint64(i)*c.config.Epoch)
+//		}
+//	}
+//
+//	extraSuffix := len(header.Extra) - extraSeal
+//	masternodesFromCheckpointHeader := common.ExtractAddressFromBytes(header.Extra[extraVanity:extraSuffix])
+//
+//	validSigners := compareSignersListsV2(masternodesFromCheckpointHeader, signers)
+//	if !validSigners {
+//		log.Error("Masternodes lists are different in checkpoint header and snapshot", "number", number,
+//			"masternodes_from_checkpoint_header", masternodesFromCheckpointHeader,
+//			"masternodes_in_snapshot", signers,
+//			"penList", penPenalties)
+//		return errInvalidCheckpointSigners
+//	}
+//
+//	if c.HookVerifyMNs != nil {
+//		err := c.HookVerifyMNs(header, masternodesFromCheckpointHeader)
+//		if err != nil {
+//			return err
+//		}
+//	}
+//
+//	// update snapshot's Signers into Cache at Checkpoint Block - 1 and not consider order of Signers based on Stake
+//	var penaltiesList []common.Address
+//	for i := 1; i <= common.LimitPenaltyEpoch; i++ {
+//		if number > uint64(i)*c.config.Epoch {
+//			penaltiesFromBlock := GetPenaltiesFromBlock(chain, number-uint64(i)*c.config.Epoch)
+//			penaltiesList = append(penaltiesList, penaltiesFromBlock...)
+//		}
+//	}
+//
+//	var newSignersList []common.Address
+//	newSignersList = append(newSignersList, masternodesFromCheckpointHeader...)
+//	newSignersList = append(newSignersList, penaltiesList...)
+//	newSignersList = append(newSignersList, penPenalties...)
+//
+//	newMNsList := make(map[common.Address]struct{})
+//	for _, signer := range newSignersList {
+//		newMNsList[signer] = struct{}{}
+//	}
+//
+//	snap.Signers = newMNsList
+//	c.recents.Add(snap.Hash, snap)
+//
+//	return nil
+//}
 
 // compare 2 signers lists
 // return true if they are same elements, otherwise return false
@@ -629,6 +690,76 @@ func compareSignersListsV2(list1 []common.Address, list2 []common.Address) bool 
 	}
 
 	return true
+}
+
+func validateTwoSignerLists(list1 []MasternodeGroup, list2 []MasternodeGroup) error {
+	for i := 0; i < len(list1); i++ {
+		x, _ := new(big.Int).SetString(list1[i].Stake, 10)
+		y, _ := new(big.Int).SetString(list2[i].Stake, 10)
+
+		if x.Cmp(y) == 0 {
+			if i != len(list1)-1 {
+				if ok := compareSignersLists(list1[i].AddressList, list2[i].AddressList); !ok {
+					return fmt.Errorf("a subset of the list of Signers that failed to validate Address, have: %v, want: %v", list1[i], list2[i])
+				}
+			} else {
+				if ok := compareSignersListsV2(list1[i].AddressList, list2[i].AddressList); !ok {
+					return fmt.Errorf("a subset of the list of Signers that failed to validate Address, have: %v, want (subset of): %v", list1[i], list2[i])
+				}
+			}
+		} else {
+			return fmt.Errorf("a subset of the list of Signers that failed to validate Stake, have: %v, want: %v", list1[i], list2[i])
+		}
+	}
+
+	return nil
+}
+
+func groupAndSortByStake(mn map[common.Address]*big.Int) []MasternodeGroup {
+	// group Address by their Stake
+	groupedMap := make(map[string][]common.Address)
+	for addr, stake := range mn {
+		groupedMap[stake.String()] = append(groupedMap[stake.String()], addr)
+	}
+
+	// convert grouped map into an array of structs
+	result := make([]MasternodeGroup, 0, len(groupedMap))
+	for stake, addrList := range groupedMap {
+		result = append(result, MasternodeGroup{
+			Stake:       stake,
+			AddressList: addrList,
+		})
+	}
+
+	// sort the array by the Stake filed in descending order
+	sort.Slice(result, func(i, j int) bool {
+		x, _ := new(big.Int).SetString(result[i].Stake, 10)
+		y, _ := new(big.Int).SetString(result[j].Stake, 10)
+		return x.Cmp(y) > 0
+	})
+
+	return result
+}
+
+func (c *Posv) buildTwoSignerLists(chain consensus.ChainReader, header *types.Header, signers []common.Address) ([]MasternodeGroup, []MasternodeGroup, error) {
+	mnContract, err := c.GetAllSignersAndStakesFromContract(chain, header)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	mnHeader := make(map[common.Address]*big.Int)
+	for _, signer := range signers {
+		stake, exist := mnContract[signer]
+		if !exist {
+			return nil, nil, fmt.Errorf("signer %v doesn't exist in Smart Contract", signer)
+		}
+		mnHeader[signer] = stake
+	}
+
+	mnGroupHeader := groupAndSortByStake(mnHeader)
+	mnGroupContract := groupAndSortByStake(mnContract)
+
+	return mnGroupHeader, mnGroupContract, nil
 }
 
 func (c *Posv) GetSnapshot(chain consensus.ChainReader, header *types.Header) (*Snapshot, error) {
@@ -1419,7 +1550,24 @@ func (c *Posv) GetSignersFromContract(chain consensus.ChainReader, checkpointHea
 	return signers, nil
 }
 
-func (c *Posv) GetSignersFromContractV2(chain consensus.ChainReader, checkpointHeader *types.Header) ([]common.Address, error) {
+//func (c *Posv) GetSignersFromContractV2(chain consensus.ChainReader, checkpointHeader *types.Header) ([]common.Address, error) {
+//	startGapBlockHeader := checkpointHeader
+//	number := checkpointHeader.Number.Uint64()
+//
+//	for step := uint64(1); step <= chain.Config().Posv.Gap; step++ {
+//		startGapBlockHeader = chain.GetHeader(startGapBlockHeader.ParentHash, number-step)
+//	}
+//
+//	signers, err := c.HookGetSignersFromContractV2(startGapBlockHeader.Hash())
+//
+//	if err != nil {
+//		return []common.Address{}, fmt.Errorf("Can't get signers from Smart Contract. Err: %v", err)
+//	}
+//
+//	return signers, nil
+//}
+
+func (c *Posv) GetAllSignersAndStakesFromContract(chain consensus.ChainReader, checkpointHeader *types.Header) (map[common.Address]*big.Int, error) {
 	startGapBlockHeader := checkpointHeader
 	number := checkpointHeader.Number.Uint64()
 
@@ -1427,10 +1575,9 @@ func (c *Posv) GetSignersFromContractV2(chain consensus.ChainReader, checkpointH
 		startGapBlockHeader = chain.GetHeader(startGapBlockHeader.ParentHash, number-step)
 	}
 
-	signers, err := c.HookGetSignersFromContractV2(startGapBlockHeader.Hash())
-
+	signers, err := c.HookGetAllSignersAndStakesFromContract(startGapBlockHeader.Hash())
 	if err != nil {
-		return []common.Address{}, fmt.Errorf("Can't get signers from Smart Contract. Err: %v", err)
+		return nil, fmt.Errorf("can't get Signers and Stakes from Smart Contract. Error: %v", err)
 	}
 
 	return signers, nil

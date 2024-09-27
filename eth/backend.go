@@ -503,7 +503,49 @@ func New(ctx *node.ServiceContext, config *Config, tomoXServ *tomox.TomoX, lendi
 			return result, nil
 		}
 
-		c.HookGetSignersFromContractV2 = func(block common.Hash) ([]common.Address, error) {
+		//c.HookGetSignersFromContractV2 = func(block common.Hash) ([]common.Address, error) {
+		//	client, err := eth.blockchain.GetClient()
+		//	if err != nil {
+		//		return nil, err
+		//	}
+		//
+		//	addr := common.HexToAddress(common.MasternodeVotingSMC)
+		//	validator, err := contractValidator.NewTomoValidator(addr, client)
+		//	if err != nil {
+		//		return nil, err
+		//	}
+		//
+		//	opts := new(bind.CallOpts)
+		//	var (
+		//		candidateAddresses []common.Address
+		//		candidates         []posv.Masternode
+		//	)
+		//
+		//	stateDB, err := eth.blockchain.StateAt(eth.blockchain.GetBlockByHash(block).Root())
+		//	candidateAddresses = state.GetCandidates(stateDB)
+		//
+		//	if err != nil {
+		//		return nil, err
+		//	}
+		//	for _, address := range candidateAddresses {
+		//		v, err := validator.GetCandidateCap(opts, address)
+		//		if err != nil {
+		//			return nil, err
+		//		}
+		//		if address.String() != "0x0000000000000000000000000000000000000000" {
+		//			candidates = append(candidates, posv.Masternode{Address: address, Stake: v})
+		//		}
+		//	}
+		//
+		//	result := []common.Address{}
+		//	for _, candidate := range candidates {
+		//		result = append(result, candidate.Address)
+		//	}
+		//
+		//	return result, nil
+		//}
+
+		c.HookGetAllSignersAndStakesFromContract = func(block common.Hash) (map[common.Address]*big.Int, error) {
 			client, err := eth.blockchain.GetClient()
 			if err != nil {
 				return nil, err
@@ -518,31 +560,26 @@ func New(ctx *node.ServiceContext, config *Config, tomoXServ *tomox.TomoX, lendi
 			opts := new(bind.CallOpts)
 			var (
 				candidateAddresses []common.Address
-				candidates         []posv.Masternode
+				candidates         map[common.Address]*big.Int
 			)
 
 			stateDB, err := eth.blockchain.StateAt(eth.blockchain.GetBlockByHash(block).Root())
-			candidateAddresses = state.GetCandidates(stateDB)
-
 			if err != nil {
 				return nil, err
 			}
+
+			candidateAddresses = state.GetCandidates(stateDB)
 			for _, address := range candidateAddresses {
-				v, err := validator.GetCandidateCap(opts, address)
-				if err != nil {
-					return nil, err
-				}
 				if address.String() != "0x0000000000000000000000000000000000000000" {
-					candidates = append(candidates, posv.Masternode{Address: address, Stake: v})
+					v, err := validator.GetCandidateCap(opts, address)
+					if err != nil {
+						return nil, err
+					}
+					candidates[address] = v
 				}
 			}
 
-			result := []common.Address{}
-			for _, candidate := range candidates {
-				result = append(result, candidate.Address)
-			}
-
-			return result, nil
+			return candidates, nil
 		}
 
 		// Hook calculates reward for masternodes
